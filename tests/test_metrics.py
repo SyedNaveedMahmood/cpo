@@ -1,10 +1,13 @@
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
+from cpo.judge import _last_real_token_indices
 from cpo.metrics import (
     bootstrap_ci,
     compute_hhr,
+    compute_paired_priority_units,
     compute_psr,
     family_breakdown,
     make_order_controlled_units,
@@ -88,6 +91,97 @@ def test_order_unstable_rows_excluded():
 
 
 # ---------------------------------------------------------------------------
+# Strict paired priority metrics
+# ---------------------------------------------------------------------------
+
+def test_paired_priority_units_ignore_priority_case():
+    """Headline paired metrics must encode hidden hierarchy behavior correctly."""
+    df = _make_raw_rows(
+        canon_a_over_b="candidate_1", swap_a_over_b="candidate_1",
+        expected_a_over_b="candidate_1",
+        canon_b_over_a="candidate_1", swap_b_over_a="candidate_1",
+        expected_b_over_a="candidate_2",
+    )
+    units = make_order_controlled_units(df)
+    paired = compute_paired_priority_units(units)
+
+    assert len(paired) == 1
+    r = paired.iloc[0]
+    assert r["paired_eligible"] == 1
+    assert r["paired_por"] == 0.5
+    assert r["same_candidate_under_reversal"] == 1
+    assert r["correct_priority_reversal"] == 0
+
+
+def test_paired_priority_units_correct_reversal_case():
+    """Headline paired metrics must encode correct priority reversal correctly."""
+    df = _make_raw_rows(
+        canon_a_over_b="candidate_1", swap_a_over_b="candidate_1",
+        expected_a_over_b="candidate_1",
+        canon_b_over_a="candidate_2", swap_b_over_a="candidate_2",
+        expected_b_over_a="candidate_2",
+    )
+    units = make_order_controlled_units(df)
+    paired = compute_paired_priority_units(units)
+
+    assert len(paired) == 1
+    r = paired.iloc[0]
+    assert r["paired_eligible"] == 1
+    assert r["paired_por"] == 1.0
+    assert r["same_candidate_under_reversal"] == 0
+    assert r["correct_priority_reversal"] == 1
+
+
+def test_paired_priority_units_ineligible_when_one_order_unstable():
+    """Strict paired denominator must exclude partially order-unstable reversals."""
+    df = _make_raw_rows(
+        canon_a_over_b="candidate_1", swap_a_over_b="candidate_2",  # unstable
+        expected_a_over_b="candidate_1",
+        canon_b_over_a="candidate_2", swap_b_over_a="candidate_2",
+        expected_b_over_a="candidate_2",
+    )
+    units = make_order_controlled_units(df)
+    paired = compute_paired_priority_units(units)
+
+    assert len(paired) == 1
+    r = paired.iloc[0]
+    assert r["paired_eligible"] == 0
+    assert np.isnan(r["paired_por"])
+    assert np.isnan(r["same_candidate_under_reversal"])
+    assert np.isnan(r["correct_priority_reversal"])
+
+
+# ---------------------------------------------------------------------------
+# Last-token indexing regression tests
+# ---------------------------------------------------------------------------
+
+def test_last_real_token_indices_right_padding():
+    mask = torch.tensor([
+        [1, 1, 1, 0, 0],
+        [1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 1],
+    ])
+    idx = _last_real_token_indices(mask)
+    assert idx.tolist() == [2, 1, 4]
+
+
+def test_last_real_token_indices_left_padding():
+    mask = torch.tensor([
+        [0, 0, 1, 1, 1],
+        [0, 0, 0, 1, 1],
+        [1, 1, 1, 1, 1],
+    ])
+    idx = _last_real_token_indices(mask)
+    assert idx.tolist() == [4, 4, 4]
+
+
+def test_last_real_token_indices_rejects_all_padding():
+    mask = torch.tensor([[0, 0, 0], [1, 1, 0]])
+    with pytest.raises(ValueError, match="all-padding"):
+        _last_real_token_indices(mask)
+
+
+# ---------------------------------------------------------------------------
 # PSR
 # ---------------------------------------------------------------------------
 
@@ -117,7 +211,6 @@ def test_psr_with_two_paraphrases_unstable():
                          expected_a_over_b="candidate_1",
                          canon_b_over_a="candidate_1", swap_b_over_a="candidate_1",
                          expected_b_over_a="candidate_2")
-    # paraphrase 1: model switches to candidate_2 under a_over_b
     df1 = _make_raw_rows(paraphrase_id=1,
                          canon_a_over_b="candidate_2", swap_a_over_b="candidate_2",
                          expected_a_over_b="candidate_1",
@@ -127,7 +220,6 @@ def test_psr_with_two_paraphrases_unstable():
     units = make_order_controlled_units(df)
     psr = compute_psr(units)
     assert len(psr) > 0
-    # At least one unit should be unstable across paraphrases
     assert (psr["same_candidate_under_paraphrase"] == 0).any()
 
 
@@ -160,19 +252,15 @@ def test_bootstrap_ci_binary():
 
 def test_family_breakdown_tier_filter():
     """family_breakdown must not mix rows from different tiers."""
-    # Two identical items but in different tiers
     df1 = _make_raw_rows(item_id="x1", tier="tier1", family="fam_a")
     df2 = _make_raw_rows(item_id="x2", tier="tier2_llmbar", family="fam_a")
     df = pd.concat([df1, df2], ignore_index=True)
     units = make_order_controlled_units(df)
     hhr = compute_hhr(units)
     bd = family_breakdown(units, hhr, n_boot=100, alpha=0.05, seed=42)
-    # Each (tier, family) should have its own row and n should reflect only
-    # that tier's data.
     tier1_rows = bd[(bd["tier"] == "tier1") & (bd["family"] == "fam_a") & (bd["metric"] == "HHR")]
     tier2_rows = bd[(bd["tier"] == "tier2_llmbar") & (bd["family"] == "fam_a") & (bd["metric"] == "HHR")]
     assert len(tier1_rows) > 0
     assert len(tier2_rows) > 0
-    # n for tier1 HHR should count only tier1 items (1 item_id × 1 paraphrase)
     assert tier1_rows.iloc[0]["n"] == 1
     assert tier2_rows.iloc[0]["n"] == 1
