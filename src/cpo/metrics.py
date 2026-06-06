@@ -94,7 +94,7 @@ def compute_hhr(units: pd.DataFrame) -> pd.DataFrame:
 
     For each conflict item that is order-stable under both priority conditions,
     record whether the judge chose the same candidate under priority reversal
-    (same_candidate_under_reversal = 1 → HHR event).
+    (same_candidate_under_reversal = 1 -> HHR event).
 
     Also records correct_priority_reversal = 1 when the judge chose correctly
     under BOTH priority orderings (i.e., RSR numerator).
@@ -112,8 +112,6 @@ def compute_hhr(units: pd.DataFrame) -> pd.DataFrame:
         p1 = r1["stable_pred_candidate"]
         p2 = r2["stable_pred_candidate"]
         same = int(p1 == p2)
-        # RSR: judge chose p1 under a_over_b AND p2 under b_over_a,
-        # and both choices were priority-obedient.
         correct_both = int(
             (p1 == r1["expected_candidate"]) and (p2 == r2["expected_candidate"])
         )
@@ -130,23 +128,196 @@ def compute_hhr(units: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Paired priority-denominator metrics
+# ---------------------------------------------------------------------------
+
+def compute_paired_priority_units(units: pd.DataFrame) -> pd.DataFrame:
+    """Build strict paired-priority units for headline CPO/HCH reporting.
+
+    The older ``main_results.csv`` reports POR-C over individual order-stable
+    priority decisions, while HHR/RSR are necessarily computed over paired
+    priority reversals.  That is useful diagnostically but can confuse readers.
+
+    This function creates one row per conflict item/paraphrase after pairing the
+    two explicit priority directions:
+
+      - a_over_b: criterion A outranks criterion B
+      - b_over_a: criterion B outranks criterion A
+
+    A row is marked ``paired_eligible=1`` only when BOTH priority directions are
+    available and BOTH are order-stable.  The paired headline metrics should be
+    computed from this table:
+
+      - PAIRED_POR_C: mean of correctness across the two priority directions
+      - PAIRED_HHR: same candidate selected under priority reversal
+      - PAIRED_RSR: both priority directions are correct
+      - PAIRED_RETENTION: fraction of possible paired reversals that survive
+        the strict order-stability filter
+    """
+    if units.empty:
+        return pd.DataFrame()
+
+    conflict = units[units["pair_type"] == "conflict"].copy()
+    group_cols = [
+        "model_tag", "method", "item_id", "tier", "source", "family", "paraphrase_id",
+    ]
+    rows: List[Dict] = []
+
+    for key, g in conflict.groupby(group_cols, dropna=False):
+        if set(g["priority"]) != {"a_over_b", "b_over_a"}:
+            # Cannot evaluate priority reversal if either direction is missing.
+            continue
+
+        r_a = g[g["priority"] == "a_over_b"].iloc[0]
+        r_b = g[g["priority"] == "b_over_a"].iloc[0]
+
+        stable_a = int(r_a["order_stable"] == 1)
+        stable_b = int(r_b["order_stable"] == 1)
+        eligible = int(stable_a == 1 and stable_b == 1)
+
+        base = {col: val for col, val in zip(group_cols, key)}
+        row: Dict = {
+            **base,
+            "pair_possible": 1,
+            "paired_eligible": eligible,
+            "order_stable_a_over_b": stable_a,
+            "order_stable_b_over_a": stable_b,
+            "expected_a_over_b": r_a["expected_candidate"],
+            "expected_b_over_a": r_b["expected_candidate"],
+            "pred_a_over_b": np.nan,
+            "pred_b_over_a": np.nan,
+            "correct_a_over_b": np.nan,
+            "correct_b_over_a": np.nan,
+            "paired_por": np.nan,
+            "same_candidate_under_reversal": np.nan,
+            "correct_priority_reversal": np.nan,
+        }
+
+        if eligible:
+            p_a = r_a["stable_pred_candidate"]
+            p_b = r_b["stable_pred_candidate"]
+            correct_a = int(p_a == r_a["expected_candidate"])
+            correct_b = int(p_b == r_b["expected_candidate"])
+            row.update(
+                {
+                    "pred_a_over_b": p_a,
+                    "pred_b_over_a": p_b,
+                    "correct_a_over_b": correct_a,
+                    "correct_b_over_a": correct_b,
+                    "paired_por": float((correct_a + correct_b) / 2.0),
+                    "same_candidate_under_reversal": int(p_a == p_b),
+                    "correct_priority_reversal": int(correct_a == 1 and correct_b == 1),
+                }
+            )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def summarize_paired_priority(
+    paired: pd.DataFrame,
+    n_boot: int,
+    alpha: float,
+    seed: int,
+) -> pd.DataFrame:
+    """Summarize strict paired-priority metrics per (model, method, tier)."""
+    rows: List[Dict] = []
+    if paired.empty:
+        return pd.DataFrame(
+            columns=["model_tag", "method", "tier", "metric", "mean", "ci_low", "ci_high", "n"]
+        )
+
+    models_methods = paired[["model_tag", "method"]].drop_duplicates()
+    for _, mm in models_methods.iterrows():
+        model = mm["model_tag"]
+        method = mm["method"]
+        p = paired[(paired["model_tag"] == model) & (paired["method"] == method)]
+        tiers_to_report = ["all"] + sorted([str(t) for t in p["tier"].dropna().unique()])
+
+        for tier in tiers_to_report:
+            pp = p if tier == "all" else p[p["tier"] == tier]
+            if len(pp) == 0:
+                continue
+            eligible = pp[pp["paired_eligible"] == 1]
+            metrics = {
+                "PAIRED_RETENTION": pp["paired_eligible"].values,
+                "PAIRED_POR_C": eligible["paired_por"].values,
+                "PAIRED_HHR": eligible["same_candidate_under_reversal"].values,
+                "PAIRED_RSR": eligible["correct_priority_reversal"].values,
+            }
+            for metric, vals in metrics.items():
+                mean, lo, hi, n = bootstrap_ci(vals, n_boot=n_boot, alpha=alpha, seed=seed)
+                rows.append(
+                    {
+                        "model_tag": model,
+                        "method": method,
+                        "tier": tier,
+                        "metric": metric,
+                        "mean": mean,
+                        "ci_low": lo,
+                        "ci_high": hi,
+                        "n": n,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def paired_family_breakdown(
+    paired: pd.DataFrame,
+    n_boot: int,
+    alpha: float,
+    seed: int,
+) -> pd.DataFrame:
+    """Family-level strict paired metrics for filtered heatmaps/tables."""
+    rows: List[Dict] = []
+    if paired.empty:
+        return pd.DataFrame(
+            columns=[
+                "model_tag", "method", "tier", "family", "metric",
+                "mean", "ci_low", "ci_high", "n",
+            ]
+        )
+
+    for (model, method, tier, family), p in paired.groupby(
+        ["model_tag", "method", "tier", "family"], dropna=False
+    ):
+        eligible = p[p["paired_eligible"] == 1]
+        metrics = {
+            "PAIRED_RETENTION": p["paired_eligible"].values,
+            "PAIRED_POR_C": eligible["paired_por"].values,
+            "PAIRED_HHR": eligible["same_candidate_under_reversal"].values,
+            "PAIRED_RSR": eligible["correct_priority_reversal"].values,
+        }
+        for metric, vals in metrics.items():
+            mean, lo, hi, n = bootstrap_ci(vals, n_boot=n_boot, alpha=alpha, seed=seed)
+            rows.append(
+                {
+                    "model_tag": model,
+                    "method": method,
+                    "tier": tier,
+                    "family": family,
+                    "metric": metric,
+                    "mean": mean,
+                    "ci_low": lo,
+                    "ci_high": hi,
+                    "n": n,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # PSR (Paraphrase Stability Rate)
 # ---------------------------------------------------------------------------
 
 def compute_psr(units: pd.DataFrame) -> pd.DataFrame:
-    """Compute paraphrase stability for items evaluated with multiple rubric phrasings.
+    """Compute paraphrase stability for items evaluated with multiple rubrics.
 
     PSR is defined only when at least 2 paraphrase variants exist for a unit.
-    Units with only 1 paraphrase are NOT included in the PSR computation —
-    this is by design; the metric is undefined for a single paraphrase.
-
-    FIX vs original: the original code required len(preds) < 2 check but the
-    groupby was on (item_id, ..., priority) which with paraphrase_id in the
-    group cols produced one row per paraphrase — so it would always have
-    len(preds)==1.  Fixed: paraphrase_id is excluded from the groupby here.
+    Units with only 1 paraphrase are not included in PSR computation.
     """
     stable = units[units["order_stable"] == 1].copy()
-    # Aggregate across paraphrase_id to get all paraphrase variants per unit.
     group_cols = [
         "model_tag", "method", "item_id", "tier", "source",
         "family", "pair_type", "priority",
@@ -155,7 +326,6 @@ def compute_psr(units: pd.DataFrame) -> pd.DataFrame:
     for key, g in stable.groupby(group_cols, dropna=False):
         preds = list(g.sort_values("paraphrase_id")["stable_pred_candidate"].dropna())
         if len(preds) < 2:
-            # Only one paraphrase available for this unit — PSR undefined.
             continue
         rows.append(
             {
@@ -180,15 +350,18 @@ def summarize_units(
     alpha: float,
     seed: int,
 ) -> pd.DataFrame:
-    """Produce the main results table (Table 1 in the paper).
+    """Produce the diagnostic main results table.
 
     Metrics per (model_tag, method, tier):
-      OSR   - order-stable retention
-      POR_C - priority obedience rate, conflict items, order-stable
-      POR_NC- priority obedience rate, no-conflict items, order-stable
-      HHR   - hidden hierarchy rate (from hhr rows)
-      RSR   - reversal success rate (from hhr rows, correct_priority_reversal)
-      PSR   - paraphrase stability rate (from psr rows)
+      OSR    - order-stable retention
+      POR_C  - priority obedience rate, conflict items, order-stable units
+      POR_NC - priority obedience rate, no-conflict items, order-stable units
+      HHR    - hidden hierarchy rate over paired priority reversals
+      RSR    - reversal success rate over paired priority reversals
+      PSR    - paraphrase stability rate
+
+    For the headline paper table, prefer paired_main_results.csv, which uses a
+    single strict paired denominator for POR-C/HHR/RSR.
     """
     rows: List[Dict] = []
     models_methods = units[["model_tag", "method"]].drop_duplicates()
@@ -223,9 +396,6 @@ def summarize_units(
                 "POR_C": conflict_stable["priority_obedient_if_stable"].values,
                 "POR_NC": noconf_stable["priority_obedient_if_stable"].values,
                 "HHR": hh["same_candidate_under_reversal"].values if len(hh) else [],
-                # RSR and HHR are computed from the same hhr rows but on
-                # different columns.  HHR = same_candidate_under_reversal.
-                # RSR = correct_priority_reversal (judge was right under BOTH).
                 "RSR": hh["correct_priority_reversal"].values if len(hh) else [],
                 "PSR": (
                     pp["same_candidate_under_paraphrase"].values
@@ -263,7 +433,7 @@ def family_breakdown(
     alpha: float,
     seed: int,
 ) -> pd.DataFrame:
-    """Compute per-family metrics for the HHR heatmap (Figure 2)."""
+    """Compute per-family metrics for the diagnostic HHR heatmap."""
     rows: List[Dict] = []
     for (model, method, tier, family), u in units.groupby(
         ["model_tag", "method", "tier", "family"], dropna=False
@@ -271,10 +441,6 @@ def family_breakdown(
         conflict_stable = u[
             (u["pair_type"] == "conflict") & (u["order_stable"] == 1)
         ]
-        # FIX: filter hhr by tier as well as model/method/family.
-        # The original filtered on ['model_tag', 'method', 'family'] but not
-        # 'tier', so the hhr sub-table could contain rows from all tiers,
-        # inflating n and distorting the per-tier heatmap.
         hh = hhr[
             (hhr["model_tag"] == model)
             & (hhr["method"] == method)
@@ -331,19 +497,33 @@ def compute_all_metrics(
     units = make_order_controlled_units(raw)
     hhr = compute_hhr(units)
     psr = compute_psr(units)
+    paired = compute_paired_priority_units(units)
+
     summary = summarize_units(units, hhr, psr, n_boot=n_boot, alpha=alpha, seed=seed)
     family = family_breakdown(units, hhr, n_boot=n_boot, alpha=alpha, seed=seed)
+    paired_summary = summarize_paired_priority(
+        paired, n_boot=n_boot, alpha=alpha, seed=seed
+    )
+    paired_family = paired_family_breakdown(
+        paired, n_boot=n_boot, alpha=alpha, seed=seed
+    )
 
     paths = {
         "order_controlled_units": out_dir / "order_controlled_units.csv",
         "hhr_rows": out_dir / "hhr_rows.csv",
         "psr_rows": out_dir / "psr_rows.csv",
+        "paired_priority_units": out_dir / "paired_priority_units.csv",
         "main_results": out_dir / "main_results.csv",
         "family_breakdown": out_dir / "family_breakdown.csv",
+        "paired_main_results": out_dir / "paired_main_results.csv",
+        "paired_family_breakdown": out_dir / "paired_family_breakdown.csv",
     }
     units.to_csv(paths["order_controlled_units"], index=False)
     hhr.to_csv(paths["hhr_rows"], index=False)
     psr.to_csv(paths["psr_rows"], index=False)
+    paired.to_csv(paths["paired_priority_units"], index=False)
     summary.to_csv(paths["main_results"], index=False)
     family.to_csv(paths["family_breakdown"], index=False)
+    paired_summary.to_csv(paths["paired_main_results"], index=False)
+    paired_family.to_csv(paths["paired_family_breakdown"], index=False)
     return paths
