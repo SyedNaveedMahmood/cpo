@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
@@ -14,7 +16,10 @@ from .metrics import compute_all_metrics
 from .plots import make_all_plots
 from .synthetic import generate_tier1
 from .tier2 import merge_benchmarks, normalize_llmbar, normalize_wildbench
-from .utils import disable_proxy_env, ensure_dir, gpu_memory_used_mb, load_config, read_jsonl, set_seed, write_jsonl
+from .utils import disable_proxy_env, ensure_dir, gpu_memory_used_mb, load_config, set_seed, write_jsonl
+
+
+ARTIFACT_KEYS = ("raw", "tables", "figures")
 
 
 def resolve_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
@@ -27,6 +32,81 @@ def resolve_paths(cfg: Dict[str, Any]) -> Dict[str, Path]:
         "figures": out / "figures",
         "cache": Path(cfg.get("cache_dir", "hf_cache")),
     }
+
+
+# ---------------------------------------------------------------------------
+# Artifact archival
+# ---------------------------------------------------------------------------
+
+def _path_has_artifacts(path: Path) -> bool:
+    """Return True when a path contains files from a previous computation."""
+    if not path.exists():
+        return False
+    if path.is_file():
+        return path.stat().st_size > 0
+    if not path.is_dir():
+        return False
+    for child in path.rglob("*"):
+        if child.is_file() and child.stat().st_size > 0:
+            return True
+    return False
+
+
+def archive_existing_artifacts(
+    paths: Dict[str, Path],
+    keys: Iterable[str],
+    command_name: str,
+    enabled: bool = True,
+) -> Path | None:
+    """Move stale run artifacts into a timestamped archive directory.
+
+    This protects against accidentally mixing old raw choices, stale metric
+    tables, and stale figures with a new run after scoring or metric code has
+    changed. Data/cache directories are intentionally not archived.
+    """
+    if not enabled:
+        return None
+
+    candidates: List[tuple[str, Path]] = []
+    for key in keys:
+        path = paths[key]
+        if _path_has_artifacts(path):
+            candidates.append((key, path))
+
+    if not candidates:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = paths["out"] / "archives" / f"{timestamp}_{command_name}"
+    ensure_dir(archive_dir)
+
+    manifest: Dict[str, Any] = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "command": command_name,
+        "reason": "Existing run artifacts were present before recomputation.",
+        "moved": [],
+    }
+
+    for key, source in candidates:
+        target = archive_dir / key
+        suffix = 1
+        while target.exists():
+            suffix += 1
+            target = archive_dir / f"{key}_{suffix}"
+        shutil.move(str(source), str(target))
+        manifest["moved"].append(
+            {
+                "artifact_key": key,
+                "from": str(source),
+                "to": str(target),
+            }
+        )
+
+    (archive_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(f"Archived existing artifacts -> {archive_dir}")
+    return archive_dir
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +140,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# download
+# download / build data
 # ---------------------------------------------------------------------------
 
 def cmd_download(args: argparse.Namespace) -> None:
@@ -72,10 +152,6 @@ def cmd_download(args: argparse.Namespace) -> None:
     print(json.dumps(downloaded, indent=2))
 
 
-# ---------------------------------------------------------------------------
-# build-tier1
-# ---------------------------------------------------------------------------
-
 def cmd_build_tier1(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     disable_proxy_env(bool(cfg.get("allow_proxy", False)))
@@ -84,9 +160,6 @@ def cmd_build_tier1(args: argparse.Namespace) -> None:
     ensure_dir(paths["data"])
     data_cfg = cfg["data"]
     families = list(data_cfg["families"])
-    # Safety family is INCLUDED by default (it is in the proposal's family list).
-    # If you need to exclude it (e.g., for a fast ablation), set
-    # include_safety_family: false in the config.
     if not data_cfg.get("include_safety_family", True):
         families = [f for f in families if f != "safety_vs_helpfulness"]
     conflict, no_conflict = generate_tier1(
@@ -104,10 +177,6 @@ def cmd_build_tier1(args: argparse.Namespace) -> None:
     print(f"wrote {len(no_conflict)} no-conflict items -> {nc_path}")
 
 
-# ---------------------------------------------------------------------------
-# build-tier2
-# ---------------------------------------------------------------------------
-
 def cmd_build_tier2(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     disable_proxy_env(bool(cfg.get("allow_proxy", False)))
@@ -121,10 +190,6 @@ def cmd_build_tier2(args: argparse.Namespace) -> None:
     out_llmbar = paths["data"] / "tier2_llmbar_cpo.jsonl"
     out_wildbench = paths["data"] / "tier2_wildbench_cpo.jsonl"
 
-    # Pass require_adversarial flag from config.  This is False when the HF
-    # download flattens all splits into a single stream (no split metadata),
-    # which is common with some dataset versions.  Check the diagnostics JSON
-    # to verify actual filter yield.
     require_adversarial = bool(cfg.get("llmbar_require_adversarial_filter", True))
     n1 = normalize_llmbar(
         raw_llmbar,
@@ -143,16 +208,15 @@ def cmd_build_tier2(args: argparse.Namespace) -> None:
     print(f"wrote {n1} LLMBar CPO-mined items -> {out_llmbar}")
     if n1 == 0:
         print(
-            "  WARNING: 0 LLMBar items written.  If you used load_dataset() and "
-            "the split metadata was flattened, set llmbar_require_adversarial_filter: false "
-            "in your config and rerun build-tier2."
+            "  WARNING: 0 LLMBar items written. If split metadata was flattened, "
+            "set llmbar_require_adversarial_filter: false and rerun build-tier2."
         )
 
     print(f"wrote {n2} WildBench CPO-mined items -> {out_wildbench}")
     if n2 == 0:
         print(
-            "  WARNING: 0 WildBench items written.  The miner requires at least 2 "
-            "candidate responses per row.  Check wildbench_raw.jsonl schema."
+            "  WARNING: 0 WildBench items written. The miner requires at least 2 "
+            "candidate responses per row. Check wildbench_raw.jsonl schema."
         )
 
     available = [
@@ -189,7 +253,6 @@ def _make_model_config(cfg: Dict[str, Any], model_tag: str):
 
 
 def _check_hf_login_if_required(m: Dict[str, Any], model_tag: str) -> None:
-    """Check that HF_TOKEN is set for gated models (e.g., Llama 3.x)."""
     if not m.get("requires_hf_login", False):
         return
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -220,20 +283,21 @@ def cmd_run(args: argparse.Namespace) -> None:
     disable_proxy_env(bool(cfg.get("allow_proxy", False)))
     set_seed(int(cfg["seed"]))
     paths = resolve_paths(cfg)
+    archive_existing_artifacts(
+        paths,
+        ARTIFACT_KEYS,
+        command_name="run",
+        enabled=not getattr(args, "no_archive_existing", False),
+    )
     ensure_dir(paths["raw"])
 
-    # Resolve benchmark data path.
     data_path = Path(args.data) if args.data else paths["data"] / "merged_all.jsonl"
     if not data_path.exists():
-        fallbacks = [
-            paths["data"] / "tier1_all.jsonl",
-            paths["data"] / "tier1_conflict.jsonl",
-        ]
+        fallbacks = [paths["data"] / "tier1_all.jsonl", paths["data"] / "tier1_conflict.jsonl"]
         data_path = next((p for p in fallbacks if p.exists()), data_path)
     if not data_path.exists():
         raise FileNotFoundError(
-            f"Benchmark data not found. Run build-tier1 / build-tier2 first. "
-            f"Missing: {data_path}"
+            f"Benchmark data not found. Run build-tier1 / build-tier2 first. Missing: {data_path}"
         )
     items = load_items([data_path])
     print(f"Loaded {len(items)} CPO items from {data_path}")
@@ -296,17 +360,11 @@ def cmd_run(args: argparse.Namespace) -> None:
                     )
                 elif method == "decomposed":
                     df = run_decomposed(judge, items, mcfg.batch_size)
-                    # Save criterion-level rows separately (needed for paper's
-                    # decomposed analysis and reproducibility).
                     crit = df.attrs.get("criterion_rows")
                     if isinstance(crit, pd.DataFrame) and len(crit) > 0:
                         crit.to_csv(method_out / "criterion_rows.csv", index=False)
                         save_dataframe_jsonl(crit, method_out / "criterion_rows.jsonl")
                 elif method == "context_forward":
-                    # context_forward runs its own internal decomposed pass.
-                    # We do NOT run decomposed separately here to avoid double
-                    # inference.  If you want decomposed results saved, run
-                    # the decomposed method as a separate method entry.
                     df = run_context_forward(judge, items, mcfg.batch_size)
                 else:
                     raise ValueError(f"Unknown method: {method}")
@@ -322,12 +380,18 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# metrics
+# metrics / plots
 # ---------------------------------------------------------------------------
 
 def cmd_metrics(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     paths = resolve_paths(cfg)
+    archive_existing_artifacts(
+        paths,
+        ("tables", "figures"),
+        command_name="metrics",
+        enabled=not getattr(args, "no_archive_existing", False),
+    )
     raw_paths = list(paths["raw"].glob("*/*/raw_choices.jsonl"))
     if not raw_paths:
         raise FileNotFoundError(f"No raw choices found under {paths['raw']}")
@@ -342,20 +406,18 @@ def cmd_metrics(args: argparse.Namespace) -> None:
     print(json.dumps({k: str(v) for k, v in out.items()}, indent=2))
 
 
-# ---------------------------------------------------------------------------
-# plots
-# ---------------------------------------------------------------------------
-
 def cmd_plots(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     paths = resolve_paths(cfg)
+    archive_existing_artifacts(
+        paths,
+        ("figures",),
+        command_name="plots",
+        enabled=not getattr(args, "no_archive_existing", False),
+    )
     made = make_all_plots(paths["tables"], paths["figures"])
     print(json.dumps({k: str(v) for k, v in made.items()}, indent=2))
 
-
-# ---------------------------------------------------------------------------
-# pipeline
-# ---------------------------------------------------------------------------
 
 def cmd_pipeline(args: argparse.Namespace) -> None:
     if not args.skip_download:
@@ -371,39 +433,56 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+def _add_common_config(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--config", required=True)
+
+
+def _add_archive_flag(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument(
+        "--no-archive-existing",
+        action="store_true",
+        help="Disable automatic timestamped archival of existing run artifacts.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cpo", description="CPO/HCH Paper 1 pipeline")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor").set_defaults(func=cmd_doctor)
 
-    for name, func in [
-        ("download", cmd_download),
-        ("build-tier1", cmd_build_tier1),
-        ("build-tier2", cmd_build_tier2),
-        ("metrics", cmd_metrics),
-        ("plots", cmd_plots),
-    ]:
+    for name, func in [("download", cmd_download), ("build-tier1", cmd_build_tier1), ("build-tier2", cmd_build_tier2)]:
         sp = sub.add_parser(name)
-        sp.add_argument("--config", required=True)
+        _add_common_config(sp)
         sp.set_defaults(func=func)
 
+    metrics_p = sub.add_parser("metrics")
+    _add_common_config(metrics_p)
+    _add_archive_flag(metrics_p)
+    metrics_p.set_defaults(func=cmd_metrics)
+
+    plots_p = sub.add_parser("plots")
+    _add_common_config(plots_p)
+    _add_archive_flag(plots_p)
+    plots_p.set_defaults(func=cmd_plots)
+
     run_p = sub.add_parser("run")
-    run_p.add_argument("--config", required=True)
+    _add_common_config(run_p)
     run_p.add_argument("--data", default=None)
     run_p.add_argument("--models", nargs="*", default=None)
     run_p.add_argument("--methods", nargs="*", default=None)
-    run_p.add_argument("--force", action="store_true",
-                       help="Re-run and overwrite existing raw_choices.jsonl files.")
+    run_p.add_argument("--force", action="store_true", help="Re-run and overwrite existing raw_choices.jsonl files.")
+    _add_archive_flag(run_p)
     run_p.set_defaults(func=cmd_run)
 
     pipe_p = sub.add_parser("pipeline")
-    pipe_p.add_argument("--config", required=True)
+    _add_common_config(pipe_p)
     pipe_p.add_argument("--data", default=None)
     pipe_p.add_argument("--models", nargs="*", default=None)
     pipe_p.add_argument("--methods", nargs="*", default=None)
     pipe_p.add_argument("--force", action="store_true")
     pipe_p.add_argument("--skip-download", action="store_true")
+    _add_archive_flag(pipe_p)
     pipe_p.set_defaults(func=cmd_pipeline)
     return p
 
