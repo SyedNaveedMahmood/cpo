@@ -5,7 +5,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ from .prompts import (
     priority_criteria,
 )
 from .schema import CPOItem
-from .utils import ensure_dir, read_jsonl, write_jsonl
+from .utils import read_jsonl, write_jsonl
 
 
 @dataclass
@@ -38,7 +38,7 @@ class ModelConfig:
     torch_dtype: str = "float16"
     # RTX 5060 Ti has 16 GiB VRAM; 15 GiB budget leaves ~1 GiB for activations
     # and OS overhead.  Using 14 GiB was conservative; 15 GiB is better for
-    # 7–8B models at 4-bit which need ~5–6 GiB model weight + KV cache.
+    # 7-8B models at 4-bit which need ~5-6 GiB model weight + KV cache.
     gpu_max_memory: str = "15GiB"
     cpu_max_memory: str = "48GiB"
     max_length: int = 1536
@@ -47,20 +47,18 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
-# A/B token discovery
+# A/B token discovery and next-token indexing
 # ---------------------------------------------------------------------------
 
 def _discover_ab_ids(tokenizer) -> Tuple[List[int], List[int]]:
-    """Return (a_ids, b_ids) — disjoint lists of token IDs that decode to 'A' and 'B'.
+    """Return disjoint token ID sets that decode to bare labels A and B.
 
-    We probe several surface forms to handle tokenizers that use leading spaces
-    (LLaMA/Mistral), no leading space (Qwen), or a newline prefix.  The key
-    requirement is that every returned ID decodes to the bare label with
-    .strip(), and that the A-set and B-set are non-overlapping.
-
-    Scores are later aggregated with logsumexp over each set, so having
-    multiple valid token IDs per label is fine — it is better than having zero.
+    Several prompt-tokenizer combinations encode label letters differently:
+    plain ``A``, leading-space `` A``, and newline-prefixed ``\nA`` can be
+    distinct single tokens. We keep every single-token form that decodes to the
+    bare label after stripping, then aggregate scores with logsumexp.
     """
+
     def probe(label: str) -> List[int]:
         ids: List[int] = []
         for surface in [label, " " + label, "\n" + label]:
@@ -75,8 +73,6 @@ def _discover_ab_ids(tokenizer) -> Tuple[List[int], List[int]]:
     b_ids = probe("B")
     overlap = set(a_ids) & set(b_ids)
     if overlap:
-        # Pathological tokenizer: remove overlapping IDs from both sets.
-        # This is a hard failure — we cannot disambiguate A from B.
         raise RuntimeError(
             f"A/B token ID overlap for model tokenizer: "
             f"A={a_ids}, B={b_ids}, overlap={overlap}. "
@@ -95,6 +91,29 @@ def _discover_ab_ids(tokenizer) -> Tuple[List[int], List[int]]:
     return a_ids, b_ids
 
 
+def _last_real_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Return the final non-padding token index for each sequence.
+
+    The previous implementation used ``attention_mask.sum(dim=1) - 1``. That is
+    correct only under right padding. Some decoder-only tokenizers default to
+    left padding during batched inference, where the final real token is at the
+    right edge of the sequence. This helper works for right padding, left
+    padding, and any mixed mask where at least one token is real.
+    """
+    if attention_mask.ndim != 2:
+        raise ValueError(f"attention_mask must be rank-2, got shape={tuple(attention_mask.shape)}")
+    if attention_mask.shape[1] == 0:
+        raise ValueError("attention_mask must have non-zero sequence length")
+    if (attention_mask.sum(dim=1) == 0).any():
+        raise ValueError("attention_mask contains an all-padding sequence")
+
+    # Flip each row and find the first real token from the right. If seq_len is
+    # T and the rightmost 1 is r positions from the right, the original index is
+    # T - 1 - r. This avoids any assumption about padding side.
+    reversed_first_real = attention_mask.flip(dims=[1]).argmax(dim=1)
+    return attention_mask.shape[1] - 1 - reversed_first_real
+
+
 # ---------------------------------------------------------------------------
 # ABJudge
 # ---------------------------------------------------------------------------
@@ -107,7 +126,6 @@ class ABJudge:
         self.device = None
         self.a_ids: List[int] = []
         self.b_ids: List[int] = []
-        # Tensors allocated after model.load()
         self.a_tensor: Optional[torch.Tensor] = None
         self.b_tensor: Optional[torch.Tensor] = None
 
@@ -120,6 +138,10 @@ class ABJudge:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Keep batched prompt tensors predictable. The scoring helper below is
+        # padding-side robust, but right padding makes stored diagnostics easier
+        # to inspect and avoids tokenizer defaults changing silently.
+        self.tokenizer.padding_side = "right"
 
         max_memory = {0: self.cfg.gpu_max_memory, "cpu": self.cfg.cpu_max_memory}
         common = dict(
@@ -155,6 +177,8 @@ class ABJudge:
             "model_tag": self.cfg.tag,
             "model_name": self.cfg.name,
             "interface": "chat_template__next_token__logsumexp",
+            "padding_side": getattr(self.tokenizer, "padding_side", None),
+            "last_token_indexing": "rightmost_nonpad_attention_mask_robust",
             "A_TOKEN_IDS": self.a_ids,
             "B_TOKEN_IDS": self.b_ids,
             "A_DECODED": [self.tokenizer.decode([i]) for i in self.a_ids],
@@ -198,17 +222,12 @@ class ABJudge:
             out = self.model(**inputs, use_cache=False)
 
         logits = out.logits.float()  # (B, T, V)
-        # Identify last real token per sequence (exclude padding).
-        seq_lengths = inputs["attention_mask"].sum(dim=1)  # (B,)
-        last_idx = (seq_lengths - 1).clamp(min=0)          # (B,)
+        last_idx = _last_real_token_indices(inputs["attention_mask"])
         batch_idx = torch.arange(logits.shape[0], device=logits.device)
         last_logits = logits[batch_idx, last_idx, :]  # (B, V)
 
-        # logsumexp over each label's token set gives a proper log-probability
-        # aggregate when there are multiple valid token IDs per label.
-        # With a single token ID this is identical to just indexing that logit.
-        score_a = last_logits[:, self.a_tensor].logsumexp(dim=-1).detach().cpu().numpy()  # (B,)
-        score_b = last_logits[:, self.b_tensor].logsumexp(dim=-1).detach().cpu().numpy()  # (B,)
+        score_a = last_logits[:, self.a_tensor].logsumexp(dim=-1).detach().cpu().numpy()
+        score_b = last_logits[:, self.b_tensor].logsumexp(dim=-1).detach().cpu().numpy()
 
         results: List[Dict[str, Any]] = []
         for a, b in zip(score_a, score_b):
@@ -241,60 +260,29 @@ class ABJudge:
 # ---------------------------------------------------------------------------
 
 def make_preflight_items(n: int) -> List[Dict[str, Any]]:
-    """Deterministic preflight items that cover both position slots.
-
-    Each semantic question appears twice: once with the better answer in slot A,
-    once with the better answer in slot B.  This tests that the model can use
-    both slots and is not trivially slot-biased.
-    """
+    """Deterministic preflight items that cover both position slots."""
     base = [
-        ("Which answer is factually correct?",
-         "Paris is the capital of France.",
-         "Berlin is the capital of France.",
-         "A"),
-        ("Which answer is factually correct?",
-         "The Sun is a planet.",
-         "The Sun is a star.",
-         "B"),
-        ("Which answer solves 2 + 2 correctly?",
-         "The answer is 4.",
-         "The answer is 5.",
-         "A"),
-        ("Which answer solves 10 - 3 correctly?",
-         "The answer is 9.",
-         "The answer is 7.",
-         "B"),
-        ("Which answer follows valid JSON with key answer?",
-         '{"answer": 42}',
-         "The answer is 42.",
-         "A"),
-        ("Which answer is a single word only?",
-         "The answer is yes.",
-         "Yes",
-         "B"),
-        ("Which answer is more complete?",
-         "Apples, bananas, oranges, and grapes.",
-         "Apples and bananas.",
-         "A"),
-        ("Which answer is more concise while still answering?",
-         "The color is blue with many unnecessary details added here.",
-         "Blue.",
-         "B"),
+        ("Which answer is factually correct?", "Paris is the capital of France.", "Berlin is the capital of France.", "A"),
+        ("Which answer is factually correct?", "The Sun is a planet.", "The Sun is a star.", "B"),
+        ("Which answer solves 2 + 2 correctly?", "The answer is 4.", "The answer is 5.", "A"),
+        ("Which answer solves 10 - 3 correctly?", "The answer is 9.", "The answer is 7.", "B"),
+        ("Which answer follows valid JSON with key answer?", '{"answer": 42}', "The answer is 42.", "A"),
+        ("Which answer is a single word only?", "The answer is yes.", "Yes", "B"),
+        ("Which answer is more complete?", "Apples, bananas, oranges, and grapes.", "Apples and bananas.", "A"),
+        ("Which answer is more concise while still answering?", "The color is blue with many unnecessary details added here.", "Blue.", "B"),
     ]
     rows: List[Dict[str, Any]] = []
     for i, (q, a, b, correct) in enumerate(base):
-        # Original orientation
+        rows.append({"example_id": f"{i}_orig", "question": q, "answer_a": a, "answer_b": b, "correct": correct})
         rows.append(
-            {"example_id": f"{i}_orig", "question": q,
-             "answer_a": a, "answer_b": b, "correct": correct}
+            {
+                "example_id": f"{i}_swap",
+                "question": q,
+                "answer_a": b,
+                "answer_b": a,
+                "correct": "B" if correct == "A" else "A",
+            }
         )
-        # Swapped orientation — correct flips
-        rows.append(
-            {"example_id": f"{i}_swap", "question": q,
-             "answer_a": b, "answer_b": a,
-             "correct": "B" if correct == "A" else "A"}
-        )
-    # Extend if n > len(rows) by cycling (deterministically)
     extended = rows[:]
     while len(extended) < n:
         extended.extend(rows)
@@ -306,10 +294,7 @@ def run_preflight(judge: ABJudge, n: int, batch_size: int) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for start in range(0, len(items), batch_size):
         batch = items[start : start + batch_size]
-        user_texts = [
-            build_preflight_prompt(x["question"], x["answer_a"], x["answer_b"])
-            for x in batch
-        ]
+        user_texts = [build_preflight_prompt(x["question"], x["answer_a"], x["answer_b"]) for x in batch]
         system_texts = ["You are an impartial evaluator."] * len(batch)
         scores = judge.score_batch(user_texts, system_texts)
         for item, score in zip(batch, scores):
@@ -351,14 +336,8 @@ def _score_request_list(
             row = dict(item["meta"])
             row.update(score)
             if "label_to_candidate_A" in row:
-                row["pred_candidate"] = (
-                    row["label_to_candidate_A"]
-                    if row["pred_label"] == "A"
-                    else row["label_to_candidate_B"]
-                )
-                row["is_priority_obedient"] = int(
-                    row["pred_candidate"] == row["expected_candidate"]
-                )
+                row["pred_candidate"] = row["label_to_candidate_A"] if row["pred_label"] == "A" else row["label_to_candidate_B"]
+                row["is_priority_obedient"] = int(row["pred_candidate"] == row["expected_candidate"])
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -429,13 +408,7 @@ def run_decomposed(
     items: List[CPOItem],
     batch_size: int,
 ) -> pd.DataFrame:
-    """Score each criterion independently, then aggregate by priority rule.
-
-    The aggregation is deterministic: the candidate that wins the primary
-    criterion is selected.  No model inference is involved in aggregation.
-    This is the key claim of the 'decomposed' baseline in the paper.
-    """
-    # --- Step 1: score each criterion independently ---
+    """Score criteria independently, then aggregate by explicit priority rule."""
     criterion_requests: List[Dict[str, Any]] = []
     for item in items:
         for order in [ORDER_CANONICAL, ORDER_SWAPPED]:
@@ -467,30 +440,21 @@ def run_decomposed(
                 )
 
     crit_df = _score_request_list(judge, criterion_requests, batch_size)
-
-    # Build lookup: (item_id, order, criterion_name) -> row dict
     lookup: Dict[tuple, dict] = {}
     for _, r in crit_df.iterrows():
-        key = (r["item_id"], r["order"], r["criterion_name"])
-        lookup[key] = r.to_dict()
+        lookup[(r["item_id"], r["order"], r["criterion_name"])] = r.to_dict()
 
-    # --- Step 2: deterministic priority aggregation ---
     rows: List[Dict[str, Any]] = []
     for item in items:
         for order in [ORDER_CANONICAL, ORDER_SWAPPED]:
             a_key = (item.item_id, order, "criterion_a")
             b_key = (item.item_id, order, "criterion_b")
             if a_key not in lookup or b_key not in lookup:
-                # Criterion scoring failed for this item/order; skip.
                 continue
             a_row = lookup[a_key]
             b_row = lookup[b_key]
             for priority in [PRIORITY_A_OVER_B, PRIORITY_B_OVER_A]:
-                chosen = (
-                    a_row["pred_candidate"]
-                    if priority == PRIORITY_A_OVER_B
-                    else b_row["pred_candidate"]
-                )
+                chosen = a_row["pred_candidate"] if priority == PRIORITY_A_OVER_B else b_row["pred_candidate"]
                 expected = item.expected_candidate(priority)
                 rows.append(
                     {
@@ -508,12 +472,7 @@ def run_decomposed(
                         "is_priority_obedient": int(chosen == expected),
                         "criterion_a_pred_candidate": a_row["pred_candidate"],
                         "criterion_b_pred_candidate": b_row["pred_candidate"],
-                        "margin_abs": float(
-                            max(
-                                a_row.get("margin_abs", 0.0) or 0.0,
-                                b_row.get("margin_abs", 0.0) or 0.0,
-                            )
-                        ),
+                        "margin_abs": float(max(a_row.get("margin_abs", 0.0) or 0.0, b_row.get("margin_abs", 0.0) or 0.0)),
                         "score_A": np.nan,
                         "score_B": np.nan,
                         "prob_A": np.nan,
@@ -523,7 +482,6 @@ def run_decomposed(
                 )
 
     out = pd.DataFrame(rows)
-    # Stash criterion rows as an attribute so the CLI can save them separately.
     out.attrs["criterion_rows"] = crit_df
     return out
 
@@ -537,44 +495,17 @@ def run_context_forward(
     items: List[CPOItem],
     batch_size: int,
 ) -> pd.DataFrame:
-    """Context-forward baseline (E7 in the proposal).
-
-    This method:
-      1. Runs decomposed criterion scoring to get per-criterion winners.
-      2. Constructs a prompt that explicitly states the per-criterion winners
-         and the priority rule, then asks the model to pick the final winner.
-
-    The key difference from the decomposed baseline is that the final
-    aggregation step is done by the MODEL given explicit structured context,
-    rather than deterministically.  This tests whether explicit context
-    reduces holistic override.
-
-    BUG FIX vs original: The original code called run_decomposed() inside
-    run_context_forward(), which caused the decomposed inference to run
-    TWICE if a caller also ran run_decomposed() separately.  The fix is to
-    call run_decomposed() once and reuse the results, which is what happens
-    when cmd_run iterates over methods.  Within run_context_forward itself
-    we always run the decomposed step fresh — this is intentional because
-    context_forward may be called independently.
-    """
-    # Run decomposed criterion scoring as the intermediate step.
+    """Run model-mediated final judging after explicit criterion winners."""
     decomp = run_decomposed(judge, items, batch_size)
-
-    # Build lookup: (item_id, order, priority) -> row dict
     decomp_lookup: Dict[tuple, dict] = {}
     for _, r in decomp.iterrows():
-        key = (r["item_id"], r["order"], r["priority"])
-        decomp_lookup[key] = r.to_dict()
+        decomp_lookup[(r["item_id"], r["order"], r["priority"])] = r.to_dict()
 
-    # Build context-forward final-choice requests.
     requests: List[Dict[str, Any]] = []
     for item in items:
         for order in [ORDER_CANONICAL, ORDER_SWAPPED]:
             mp = ordered_candidates(item, order)
             candidate_to_label = mp["candidate_to_label"]
-            # We need criterion-level winners per order.
-            # These are stored in decomp under PRIORITY_A_OVER_B as
-            # criterion_a_pred_candidate and criterion_b_pred_candidate.
             base_key = (item.item_id, order, PRIORITY_A_OVER_B)
             if base_key not in decomp_lookup:
                 continue
@@ -587,7 +518,6 @@ def run_context_forward(
             for priority in [PRIORITY_A_OVER_B, PRIORITY_B_OVER_A]:
                 primary, secondary = priority_criteria(item, priority)
                 expected = item.expected_candidate(priority)
-                # Map criterion-level winners back to A/B labels for the prompt.
                 if priority == PRIORITY_A_OVER_B:
                     primary_winner_cand = a_pred_candidate
                     secondary_winner_cand = b_pred_candidate
@@ -595,15 +525,8 @@ def run_context_forward(
                     primary_winner_cand = b_pred_candidate
                     secondary_winner_cand = a_pred_candidate
 
-                # Guard: candidate names must be in the mapping.
-                if (
-                    primary_winner_cand not in candidate_to_label
-                    or secondary_winner_cand not in candidate_to_label
-                ):
+                if primary_winner_cand not in candidate_to_label or secondary_winner_cand not in candidate_to_label:
                     continue
-
-                primary_winner_label = candidate_to_label[primary_winner_cand]
-                secondary_winner_label = candidate_to_label[secondary_winner_cand]
 
                 requests.append(
                     {
@@ -613,8 +536,8 @@ def run_context_forward(
                             str(mp["B"]),
                             primary,
                             secondary,
-                            primary_winner_label,
-                            secondary_winner_label,
+                            candidate_to_label[primary_winner_cand],
+                            candidate_to_label[secondary_winner_cand],
                         ),
                         "system_text": (
                             "You are an impartial evaluator. "
