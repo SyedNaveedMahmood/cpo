@@ -1,0 +1,81 @@
+# =========================================================
+# Python
+# =========================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================================================
+# Virtual environments
+# =========================================================
+.venv/
+venv/
+env/
+
+# =========================================================
+# VS Code / IDE
+# =========================================================
+.vscode/
+.idea/
+
+# =========================================================
+# OS files
+# =========================================================
+.DS_Store
+Thumbs.db
+
+# =========================================================
+# Hugging Face / model downloads
+# =========================================================
+hf_cache/
+
+# =========================================================
+# Large experiment outputs
+# =========================================================
+
+# Ignore all raw model generations
+outputs/**/raw/
+
+# Ignore downloaded benchmark copies
+outputs/**/data/raw_downloads/
+
+# Ignore diagnostics
+outputs/**/*.diagnostics.json
+
+# =========================================================
+# Keep final benchmark datasets
+# =========================================================
+
+!outputs/**/data/
+!outputs/**/data/tier1_all.jsonl
+!outputs/**/data/tier1_conflict.jsonl
+!outputs/**/data/tier1_no_conflict.jsonl
+!outputs/**/data/tier2_llmbar_cpo.jsonl
+!outputs/**/data/tier2_wildbench_cpo.jsonl
+!outputs/**/data/merged_all.jsonl
+
+# =========================================================
+# Keep final tables
+# =========================================================
+
+!outputs/**/tables/
+!outputs/**/tables/*.csv
+
+# =========================================================
+# Keep final figures
+# =========================================================
+
+!outputs/**/figures/
+!outputs/**/figures/*.png
+
+# =========================================================
+# Logs
+# =========================================================
+*.log
+logs/

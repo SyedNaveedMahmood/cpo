@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: cpo-hch
+Version: 0.1.0
+Summary: Criterion-Priority Obedience and Hidden Criterion Hierarchies in LLM Judges
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: accelerate>=0.33.0
+Requires-Dist: bitsandbytes>=0.43.3
+Requires-Dist: datasets>=2.20.0
+Requires-Dist: huggingface_hub>=0.24.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: pyyaml>=6.0.1
+Requires-Dist: scipy>=1.11.0
+Requires-Dist: sentencepiece>=0.2.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: transformers>=4.44.0
+Requires-Dist: protobuf>=4.25.0
+Dynamic: license-file
