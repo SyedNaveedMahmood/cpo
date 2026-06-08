@@ -1,8 +1,10 @@
 LICENSE
+README.md
 pyproject.toml
 src/cpo/__init__.py
 src/cpo/cli.py
 src/cpo/constants.py
+src/cpo/downloaders.py
 src/cpo/judge.py
 src/cpo/metrics.py
 src/cpo/plots.py

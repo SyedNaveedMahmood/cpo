@@ -1,0 +1,43 @@
+run_name: smoke_test
+seed: 2026
+output_dir: outputs/smoke_test
+cache_dir: hf_cache/smoke_test
+allow_proxy: false
+llmbar_require_adversarial_filter: true
+
+data:
+  tier1_conflict_per_family: 2
+  tier1_no_conflict_per_family_each_side: 1
+  tier2_llmbar_target_n: 10
+  tier2_wildbench_target_n: 10
+  include_safety_family: false
+  families:
+    - correctness_vs_fluency
+    - substance_vs_format
+    - evidence_vs_confidence
+    - completeness_vs_concision
+
+inference:
+  max_length: 1024
+  batch_size: 2
+  torch_dtype: float16
+  load_in_4bit: true
+  gpu_max_memory: "15GiB"
+  cpu_max_memory: "32GiB"
+  min_preflight_acc: 0.70
+  n_preflight: 16
+  paraphrases: 2
+  save_logits: true
+
+models:
+  qwen25_3b:
+    name: Qwen/Qwen2.5-3B-Instruct
+    trust_remote_code: true
+
+methods:
+  - direct
+  - decomposed
+
+metrics:
+  bootstrap_samples: 1000
+  ci_alpha: 0.05

@@ -1,0 +1,22 @@
+{
+  "created_at_utc": "2026-06-07T11:59:03.550593+00:00",
+  "command": "run",
+  "reason": "Existing run artifacts were present before recomputation.",
+  "moved": [
+    {
+      "artifact_key": "raw",
+      "from": "outputs/paper1_5060ti/raw",
+      "to": "outputs/paper1_5060ti/archives/20260607_175903_run/raw"
+    },
+    {
+      "artifact_key": "tables",
+      "from": "outputs/paper1_5060ti/tables",
+      "to": "outputs/paper1_5060ti/archives/20260607_175903_run/tables"
+    },
+    {
+      "artifact_key": "figures",
+      "from": "outputs/paper1_5060ti/figures",
+      "to": "outputs/paper1_5060ti/archives/20260607_175903_run/figures"
+    }
+  ]
+}

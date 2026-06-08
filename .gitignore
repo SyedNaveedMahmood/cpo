@@ -79,3 +79,7 @@ outputs/**/*.diagnostics.json
 # =========================================================
 *.log
 logs/
+
+*.egg-info/
+build/
+dist/

@@ -1,0 +1,17 @@
+{
+  "created_at_utc": "2026-06-08T04:22:04.397654+00:00",
+  "command": "run",
+  "reason": "Existing run artifacts were present before recomputation.",
+  "moved": [
+    {
+      "artifact_key": "raw",
+      "from": "outputs/paper1_5060ti/raw",
+      "to": "outputs/paper1_5060ti/archives/20260608_102204_run/raw"
+    },
+    {
+      "artifact_key": "tables",
+      "from": "outputs/paper1_5060ti/tables",
+      "to": "outputs/paper1_5060ti/archives/20260608_102204_run/tables"
+    }
+  ]
+}

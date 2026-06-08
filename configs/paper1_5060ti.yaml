@@ -1,0 +1,75 @@
+run_name: paper1_5060ti
+seed: 2026
+output_dir: outputs/paper1_5060ti
+cache_dir: hf_cache/paper1_5060ti
+allow_proxy: false
+
+# Set to false if the HuggingFace download of LLMBar flattens all splits
+# and the normalizer writes 0 items (check tier2_llmbar_cpo.diagnostics.json).
+llmbar_require_adversarial_filter: true
+
+data:
+  # 250 conflict items × 6 families = 1,500 conflict items (proposal target)
+  tier1_conflict_per_family: 250
+  # 25 each side × 6 families = 300 no-conflict items total
+  tier1_no_conflict_per_family_each_side: 25
+  # Naturalistic tier targets (proposal: ~200 each)
+  tier2_llmbar_target_n: 200
+  tier2_wildbench_target_n: 200
+  # Safety family IS included (it is required by the proposal, Table 7.1)
+  include_safety_family: true
+  families:
+    - correctness_vs_fluency
+    - substance_vs_format
+    - evidence_vs_confidence
+    - completeness_vs_concision
+    - safety_vs_helpfulness
+    - citation_vs_informativeness
+
+inference:
+  max_length: 1536
+  batch_size: 4
+  torch_dtype: float16
+  load_in_4bit: true
+  # RTX 5060 Ti has 16 GiB VRAM.  15 GiB leaves ~1 GiB for activations and
+  # OS overhead.  4-bit 7B models need ~4-5 GiB weights + KV cache.
+  gpu_max_memory: "15GiB"
+  cpu_max_memory: "48GiB"
+  # Preflight threshold: model must achieve ≥80% accuracy on simple A/B
+  # calibration questions to be included in analysis.
+  min_preflight_acc: 0.80
+  n_preflight: 32
+  # 2 paraphrases for PSR.  With 3 templates available for direct/locked/
+  # conflict_audit, paraphrase_id 0 and 1 are used.
+  paraphrases: 2
+  save_logits: true
+
+models:
+  qwen25_3b:
+    name: Qwen/Qwen2.5-3B-Instruct
+    trust_remote_code: true
+  qwen25_7b:
+    name: Qwen/Qwen2.5-7B-Instruct
+    trust_remote_code: true
+  mistral7b_v03:
+    name: mistralai/Mistral-7B-Instruct-v0.3
+    trust_remote_code: true
+  llama31_8b:
+    name: meta-llama/Llama-3.1-8B-Instruct
+    trust_remote_code: true
+    # Requires HF token; run `huggingface-cli login` before experiments.
+    requires_hf_login: true
+  gemma2_2b:
+    model_id: google/gemma-2-2b-it
+    requires_hf_token: true
+    load_in_4bit: true
+methods:
+  - direct  
+  - locked
+  - conflict_audit
+  - decomposed
+  - context_forward
+
+metrics:
+  bootstrap_samples: 10000
+  ci_alpha: 0.05
